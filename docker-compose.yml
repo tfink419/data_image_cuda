@@ -1,0 +1,22 @@
+version: '3'
+services:
+  cuda:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # command: bash -c "./data_image_cuda -p $PORT"
+    # command: bash -c "ls -la ; find / -name *data_image_cuda*"
+    command: bash -c "gcc data_image.cpp -o data_image -lm -lstdc++ ; ./data_image -p $PORT"
+    volumes:
+      - .:/usr/src/app
+    environment:
+      URL: ${URL}
+      QUALITY_MAP_IMAGE_DATA_PATH: ${QUALITY_MAP_IMAGE_DATA_PATH}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PORT: ${PORT}
+    ports:
+      - "${PORT}:${PORT}"
