@@ -9,23 +9,45 @@
 *
 */
 
-
-// System includes
-#include <iostream>
+// C standard libraries
 #include <stdio.h>
 #include <assert.h>
 #include <math.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+// Unix library
+#include <unistd.h>
+
+// Imported Libraries
+#include <sw/redis++/redis++.h>
+#include <curl/curl.h>
+#include "vips/vips.h"
+#include <pqxx/pqxx>
+
+// C++ standard libraries
+#include <iostream>
+#include <string>
+#include <memory>
+#include <utility>
+#include <iomanip>
+#include <string>
 
 // CUDA runtime
 #include <cuda_runtime.h>
-#include <fstream>
-#include <string>
 
 // Helper functions and utilities to work with CUDA
 #include <helper_functions.h>
 #include <helper_cuda.h>
 
 using namespace std;
+using namespace pqxx;
+using namespace sw::redis;
+
+#define MAX_POSTGRES_QUERY_SIZE 1024*10
+#define REDIS_QUEUE_NAME "data_image_qda:queue"
+#define REDIS_STATUS_DIR_NAME "data_image_qda:status"
+
 enum QualityCalcMethod { QualityLogExpSum = 0, QualityFirst = 1 };
 
 /**
@@ -101,7 +123,7 @@ __global__ void PointsInPolygonsCUDA(long start_lat, long start_lng, long image_
 * Return an array of char poly_values that is equal to whether this point is in polygon[i]
 */
 
-int PointInPolygonsImage(char **image, size_t *png_size, long start_lat,
+int PointInPolygonsImage(void **image, size_t *png_size, long start_lat,
 	long start_lng, long image_size, double quality_scale, enum QualityCalcMethod quality_calc_method,
 	double quality_calc_value, long *vectors, long total_length, double *poly_values, long num_polys, long *vector_lengths) {
 	cudaStream_t stream;
@@ -241,130 +263,247 @@ int PointInPolygonsImage(char **image, size_t *png_size, long start_lat,
 	//}
 }
 
-int retrieveValuesFromStream(istream &s, long *start_lat, long *start_lng, long *image_size, double *quality_scale, enum QualityCalcMethod *quality_calc_method,
-	double *quality_calc_value, long **vectors, long *total_length, double **poly_values, long *num_polys, long **vector_lengths) {
-	double multiply_const;
-	s.read((char *)start_lat, sizeof(*start_lat));
-	s.read((char *)start_lng, sizeof(*start_lng));
-	s.read((char *)&multiply_const, sizeof(multiply_const));
-	s.read((char *)image_size, sizeof(*image_size));
-
-	long temp_for_enum;
-	s.read((char *)quality_scale, sizeof(*quality_scale));
-	s.read((char *)&temp_for_enum, sizeof(temp_for_enum));
-	s.read((char *)quality_calc_value, sizeof(*quality_calc_value));
-	s.read((char *)num_polys, sizeof(*num_polys));
-	s.read((char *)total_length, sizeof(*total_length));
-
-	(*quality_calc_method) = (enum QualityCalcMethod) temp_for_enum;
-	(*vectors) = reinterpret_cast<long *>(malloc(sizeof(**vectors)*(*total_length) * 4));
-	(*poly_values) = reinterpret_cast<double *>(malloc(sizeof(**poly_values)*(*num_polys)));
-	(*vector_lengths) = reinterpret_cast<long *>(malloc(sizeof(**vector_lengths)*(*num_polys)));
-	if (!(*vectors || *poly_values || *vector_lengths)) {
-		fprintf(stderr, "Failed to allocate host matrix C!\n");
-		exit(EXIT_FAILURE);
-	}
-	long current_pos = 0;
-	float coord;
-	for (long i = 0, j, k; i < *num_polys; i++) {
-		s.read((char *)((*poly_values) + i), sizeof(**poly_values));
-		s.read((char *)((*vector_lengths) + i), sizeof(**vector_lengths));
-		for (j = 0; j < (*vector_lengths)[i]; j++, current_pos += 4) {
-			for (k = 0; k < 4; k++) {
-				s.read((char *)&coord, sizeof(coord));
-				(*vectors)[current_pos+k] = (long)(coord * multiply_const);
+void JsonGeometryToVectors(string json_array, double multiply_const, long **vectors, long *total_length, long *vector_length) {
+	size_t pos = 0, coord_ind, end_pos, current_pos;
+	*vector_length = 0;
+	float lat_flt, lng_flt;
+	long lat_1, lng_1, lat_2, lng_2;
+	while(json_array.find_first_of('[', pos) != string::npos) { // Polygon
+		pos++;
+		while(json_array[pos] == '[') { // Polygon or Hole
+			pos++;
+			coord_ind = 0;
+			while(json_array[pos] == '[') { // Coord
+				pos++;
+				end_pos = json_array.find_first_of(']', pos);
+				sscanf(json_array.substr(pos, end_pos-pos+1).c_str(), "%f,%f]", &lng_flt, &lat_flt);
+				lat_2 = multiply_const * lat_flt;
+				lng_2 = multiply_const * lng_flt;
+				if(coord_ind != 0) {
+					(*total_length)++;
+					(*vector_length)++;
+					if(*total_length == 1) {
+						*vectors = reinterpret_cast<long *>(malloc(sizeof(**vectors) * 4));
+					}
+					else {
+						*vectors = reinterpret_cast<long *>(realloc(*vectors, sizeof(**vectors)*(*total_length)*4));
+					}
+					current_pos=(*total_length-1)*4;
+					(*vectors)[current_pos] = lng_1;
+					(*vectors)[current_pos+1] = lat_1;
+					(*vectors)[current_pos+2] = lng_2;
+					(*vectors)[current_pos+3] = lat_2;
+				}
+				lat_1 = lat_2;
+				lng_1 = lng_2;
+				pos = end_pos+2;
+				coord_ind++;
 			}
+			pos++;
 		}
+		//[[[[],[]],[[]]],[[[],[]]]]
+		pos++;
 	}
-	return EXIT_SUCCESS;
+}
+
+int RetrieveValuesFromPG(string connection_details, string select_request, double multiply_const,
+		long **vectors, long *total_length, double **poly_values, long *num_polys, long **vector_lengths) {
+	try {
+		connection C(connection_details);
+		if (C.is_open()) {
+			cout << "Opened database successfully: " << C.dbname() << endl;
+		} else {
+			cout << "Can't open database" << endl;
+			return 1;
+		}
+		/* Create a non-transactional object. */
+		nontransaction N(C);
+		
+		/* Execute SQL query */
+		result R( N.exec( select_request ));
+		*num_polys = R.size();
+		(*poly_values) = reinterpret_cast<double *>(malloc(sizeof(**poly_values)*(*num_polys)));
+		(*vector_lengths) = reinterpret_cast<long *>(malloc(sizeof(**vector_lengths)*(*num_polys)));
+		*total_length = 0;
+		long i = 0;
+		for (result::const_iterator c = R.begin(); c != R.end(); ++c, i++) {
+			(*poly_values)[i] = c[1].as<double>();
+			JsonGeometryToVectors(c[0].as<string>(), multiply_const, vectors, total_length, (*vector_lengths)+i);
+		}
+		C.disconnect();
+	} catch (const std::exception &e) {
+		cerr << e.what() << std::endl;
+		return 1;
+	}
+	return 0;
+}
+
+int SendDataToURL(char *url, void *data, size_t data_size) {
+	CURL *curl;
+	CURLcode res;
+	auto image_curl_read_callback = [&](void *dest_ptr, size_t size, size_t nmemb, void *src_ptr) {
+		size_t amount_to_read = size*nmemb;
+		if(data_size < amount_to_read)
+			amount_to_read = data_size;
+	
+		memcpy(dest_ptr, src_ptr, amount_to_read);
+		return amount_to_read;
+	};
+
+	/* In windows, this will init the winsock stuff */ 
+	curl_global_init(CURL_GLOBAL_ALL);
+
+	/* get a curl handle */ 
+	curl = curl_easy_init();
+	if(curl) {
+		/* First set the URL that is about to receive our POST. This URL can
+			just as well be a https:// URL if that is what should receive the
+			data. */ 
+		curl_easy_setopt(curl, CURLOPT_URL, url);
+		/* Now specify the POST data */ 
+		curl_easy_setopt(curl, CURLOPT_PUT, 1L);
+		curl_easy_setopt(curl, CURLOPT_READFUNCTION, image_curl_read_callback);
+
+		curl_easy_setopt(curl, CURLOPT_INFILESIZE, data_size);
+		
+		curl_easy_setopt(curl, CURLOPT_READDATA, data);
+
+		/* Perform the request, res will get the return code */ 
+		res = curl_easy_perform(curl);
+		/* Check for errors */ 
+		if(res != CURLE_OK)
+			fprintf(stderr, "curl_easy_perform() failed: %s\n",
+				curl_easy_strerror(res));
+
+		/* always cleanup */ 
+		curl_easy_cleanup(curl);
+	}
+	curl_global_cleanup();
+	cout << endl;
+	return 0;
+}
+
+int CheckForQueue(Redis &redis, char *queue_name, string &queue_data) {
+	try {
+    auto val = redis.lpop(queue_name);
+		if(val) {
+			queue_data = *val;
+			return 1;
+		}
+		else
+			return 0;
+	} catch (const Error &e) {
+		fprintf(stderr, "%s\n", e.what());
+		return -1;
+	}
+}
+
+void ParseQueueData(string queue_data, long *queue_id, long *start_lat,
+		long *start_lng, double *multiply_const, long *image_size,
+		double *quality_scale, enum QualityCalcMethod *quality_calc_method, 
+		double *quality_calc_value, char *polygons_db_request, char *aws_s3_url) {
+	int temp_for_enum;
+	sscanf(queue_data.c_str(), "%ld %d %d %lf %d %lf %d %lf %[^\n] %[^\n]",
+		queue_id,
+		start_lat,
+		start_lng,
+		multiply_const,
+		image_size,
+		quality_scale,
+		&temp_for_enum,
+		quality_calc_value,
+		aws_s3_url,
+		polygons_db_request		
+	);
+	*quality_calc_method = (enum QualityCalcMethod) temp_for_enum;
 }
 
 /**
 * Program main
 */
 int main(int argc, char **argv) {
-	if (checkCmdLineFlag(argc, (const char **)argv, "help") ||
-		checkCmdLineFlag(argc, (const char **)argv, "?")) {
-		printf("Usage -device=n (n >= 0 for deviceID)\n");
-		exit(EXIT_SUCCESS);
+	const char *REDIS_URL, *PG_URL;
+	if(!(REDIS_URL = getenv("REDIS_URL"))) {
+		fprintf(stderr, "Missing REDIS_URL\n");
+		return 1;
 	}
-
-	// This will pick the best possible CUDA capable device, otherwise
-	// override the device ID based on input provided at the command line
-
-
-	int nDevices;
-
-	cudaGetDeviceCount(&nDevices);
-	for (int i = 0; i < nDevices; i++) {
-		cudaDeviceProp prop;
-		cudaGetDeviceProperties(&prop, i);
-		printf("Device Number: %d\n", i);
-		printf("  Device name: %s\n", prop.name);
-		printf("  Memory Clock Rate (KHz): %d\n",
-			prop.memoryClockRate);
-		printf("  Memory Bus Width (bits): %d\n",
-			prop.memoryBusWidth);
-		printf("  Peak Memory Bandwidth (GB/s): %f\n",
-			2.0*prop.memoryClockRate*(prop.memoryBusWidth / 8) / 1.0e6);
-		printf("Max grid size: [%d, %d, %d]\n", prop.maxGridSize[0], prop.maxGridSize[1], prop.maxGridSize[2]);
-		printf("maxThreadsPerBlock: %d\n", prop.maxThreadsPerBlock);
-		printf("maxSharedMemory: %d\n\n", prop.sharedMemPerBlock);
-	}
-
-
-	int dev = findCudaDevice(argc, (const char **)argv);
-	ifstream request("test_request.bin", ios::out | ios::binary);
-	if (!request || !request.is_open())
-	{
-		exit(1);
+	if(!(PG_URL = getenv("PG_URL"))) {
+		fprintf(stderr, "Missing PG_URL\n");
+		return 1;
 	}
 
 	long *vectors;
 	double *poly_values;
 	long num_polys, start_lat, start_lng, image_size, total_length;
 	enum QualityCalcMethod quality_calc_method;
-	double quality_scale, quality_calc_value;
+	double quality_scale, quality_calc_value, multiply_const;
 	long *vector_lengths;
-	cout << "Retrieving values" << endl;
-	retrieveValuesFromStream(
-		request,
-		&start_lat,
-		&start_lng,
-		&image_size,
-		&quality_scale,
-		&quality_calc_method,
-		&quality_calc_value,
-		&vectors,
-		&total_length,
-		&poly_values,
-		&num_polys,
-		&vector_lengths
-	);
+	long queue_id;
+	char polygons_db_request[MAX_POSTGRES_QUERY_SIZE];
+	char aws_s3_url[1024];
+	char status_key[128];
 
-	//for (long poly = 0, ind = 0; poly < num_polys; poly++) {
-	//	cout << "Polygon: " << poly << endl;
-	//	for (long i = 0; i < vector_lengths[poly]; i++, ind += 4) {
-	//		printf("Vector: [%d, %d, %d, %d]\n", vectors[ind], vectors[ind + 1], vectors[ind + 2], vectors[ind + 3]);
-	//	}
-	//}
-	request.close();
-	cout << "Values Retrieved" << endl;
+	Redis redis = Redis(REDIS_URL);
+	string queue_data;
+	int queue_status;
+	while(1)
+	{
+		queue_status = CheckForQueue(redis, (char *) REDIS_QUEUE_NAME, queue_data);
+		if(queue_status == 0) {
+			sleep(2);
+			continue;
+		}
+		else if(queue_status == -1) {
+			return 1;
+		}
+		sprintf(status_key,"%s:%d", REDIS_STATUS_DIR_NAME, queue_id);
+		redis.set(status_key, "started");
+		ParseQueueData(
+			queue_data,
+			&queue_id,
+			&start_lat,
+			&start_lng,
+			&multiply_const,
+			&image_size,
+			&quality_scale,
+			&quality_calc_method,
+			&quality_calc_value,
+			polygons_db_request,
+			aws_s3_url
+		);
+		cout << "Retrieving values" << endl;
+		RetrieveValuesFromPG(
+			PG_URL,
+			polygons_db_request,
+			multiply_const,
+			&vectors,
+			&total_length,
+			&poly_values,
+			&num_polys,
+			&vector_lengths
+		);
+		cout << "Values Retrieved" << endl;
 
-	char *image = NULL;
-	size_t png_size;
+		void *png_pointer = NULL;
+		size_t png_size;
 
-	cout << "Calculating..." << endl;
+		cout << "Calculating..." << endl;
 
-	PointInPolygonsImage(&image, &png_size, start_lat, start_lng, image_size, quality_scale, quality_calc_method, quality_calc_value,
-		vectors, total_length, poly_values, num_polys, vector_lengths);
+		if(PointInPolygonsImage(&png_pointer, &png_size, start_lat, start_lng, image_size, quality_scale, quality_calc_method, quality_calc_value,
+				vectors, total_length, poly_values, num_polys, vector_lengths))
+			exit(1);
 
-	if (image) {
-		free(image);
+		cout << "Sending Request" << endl;
+		cout << "Png size: " << png_size << endl;
+		if(SendDataToURL(aws_s3_url, png_pointer, png_size))
+			exit(1);
+		redis.set(status_key, "complete");
+
+		free(png_pointer);
+		free(vectors);
+		free(poly_values);
+		free(vector_lengths);
 	}
-	free(vectors);
-	free(poly_values);
-	free(vector_lengths);
 
 	std::cin.ignore();
 	exit(0);

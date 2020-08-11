@@ -1,6 +1,5 @@
 // System includes
 #include <iostream>
-#include <fstream>
 #include <string>
 #include <memory>
 #include <utility>
@@ -186,45 +185,6 @@ int PointInPolygonsImage(void **png_pointer, size_t *png_size, int32_t start_lat
 	//}
 }
 
-int retrieveValuesFromStream(istream &s, int32_t *start_lat, int32_t *start_lng, int32_t *image_size, double *quality_scale, enum QualityCalcMethod *quality_calc_method,
-		double *quality_calc_value, int32_t **vectors, int32_t *total_length, double **poly_values, int32_t *num_polys, int32_t **vector_lengths) {
-	double multiply_const;
-	s.read((char *)start_lat, sizeof(*start_lat));
-	s.read((char *)start_lng, sizeof(*start_lng));
-	s.read((char *)&multiply_const, sizeof(multiply_const));
-	s.read((char *)image_size, sizeof(*image_size));
-
-	int32_t temp_for_enum;
-	s.read((char *)quality_scale, sizeof(*quality_scale));
-	s.read((char *)&temp_for_enum, sizeof(temp_for_enum));
-	s.read((char *)quality_calc_value, sizeof(*quality_calc_value));
-	s.read((char *)num_polys, sizeof(*num_polys));
-	s.read((char *)total_length, sizeof(*total_length));
-
-	(*quality_calc_method) = (enum QualityCalcMethod) temp_for_enum;
-	(*vectors) = reinterpret_cast<int32_t *>(malloc(sizeof(**vectors)*(*total_length) * 4));
-	(*poly_values) = reinterpret_cast<double *>(malloc(sizeof(**poly_values)*(*num_polys)));
-	(*vector_lengths) = reinterpret_cast<int32_t *>(malloc(sizeof(**vector_lengths)*(*num_polys)));
-	if (!(*vectors && *poly_values && *vector_lengths)) {
-		fprintf(stderr, "Failed to allocate data!\n");
-		exit(EXIT_FAILURE);
-	}
-	int32_t current_pos = 0;
-	float coord;
-	int32_t added_length = 0;
-	for (int32_t i = 0, j, k; i < *num_polys; i++) {
-		s.read((char *)((*poly_values) + i), sizeof(**poly_values));
-		s.read((char *)((*vector_lengths) + i), sizeof(**vector_lengths));
-		for (j = 0; j < (*vector_lengths)[i]; j++, current_pos += 4) {
-			for (k = 0; k < 4; k++) {
-				s.read((char *)&coord, sizeof(coord));
-				(*vectors)[current_pos+k] = (int32_t)(coord * multiply_const);
-			}
-		}
-	}
-	return EXIT_SUCCESS;
-}
-
 void JsonGeometryToVectors(string json_array, double multiply_const, int32_t **vectors, int32_t *total_length, int32_t *vector_length) {
 	size_t pos = 0, coord_ind, end_pos, current_pos;
 	*vector_length = 0;
@@ -300,20 +260,18 @@ int RetrieveValuesFromPG(string connection_details, string select_request, doubl
 	return 0;
 }
 
-size_t png_size_for_callback;
-static size_t image_curl_read_callback(void *dest_ptr, size_t size, size_t nmemb, void *src_ptr)
-{
-	size_t amount_to_read = size*nmemb;
-	if(png_size_for_callback < amount_to_read)
-		amount_to_read = png_size_for_callback;
-
-	memcpy(dest_ptr, src_ptr, amount_to_read);
-  return amount_to_read;
-}
 
 int SendDataToURL(char *url, void *data, size_t data_size) {
 	CURL *curl;
 	CURLcode res;
+	auto image_curl_read_callback = [](void *dest_ptr, size_t size, size_t nmemb, void *src_ptr) {
+		size_t amount_to_read = size*nmemb;
+		if(data_size < amount_to_read)
+			amount_to_read = data_size;
+	
+		memcpy(dest_ptr, src_ptr, amount_to_read);
+		return amount_to_read;
+	};
 
 	/* In windows, this will init the winsock stuff */ 
 	curl_global_init(CURL_GLOBAL_ALL);
@@ -427,7 +385,7 @@ int main(int argc, char **argv) {
 		else if(queue_status == -1) {
 			return 1;
 		}
-		sprintf(status_key,"%s:%d", REDIS_STATUS_DIR_NAME, queue_id)
+		sprintf(status_key,"%s:%d", REDIS_STATUS_DIR_NAME, queue_id);
 		redis.set(status_key, "started");
 		ParseQueueData(
 			queue_data,
