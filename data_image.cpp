@@ -264,7 +264,7 @@ int RetrieveValuesFromPG(string connection_details, string select_request, doubl
 int SendDataToURL(char *url, void *data, size_t data_size) {
 	CURL *curl;
 	CURLcode res;
-	auto image_curl_read_callback = [](void *dest_ptr, size_t size, size_t nmemb, void *src_ptr) {
+	auto image_curl_read_callback = [&](void *dest_ptr, size_t size, size_t nmemb, void *src_ptr) {
 		size_t amount_to_read = size*nmemb;
 		if(data_size < amount_to_read)
 			amount_to_read = data_size;
