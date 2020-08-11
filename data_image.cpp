@@ -1,27 +1,31 @@
 // System includes
 #include <iostream>
+#include <fstream>
+#include <string>
+#include <memory>
+#include <utility>
+#include <cstdlib>
+
+#include <iomanip>
+#include <stdint.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <math.h>
-#include <sys/socket.h> // For socket functions
-#include <netinet/in.h> // For sockaddr_in
-#include <unistd.h> // For read
-#include <cstdlib> // For exit() and EXIT_FAILURE
 
+#include <sw/redis++/redis++.h>
 #include <pqxx/pqxx> 
 #include <curl/curl.h>
 #include "vips/vips.h"
 
-#include <fstream>
-#include <string>
-#include <stdint.h>
 
 using namespace std;
 using namespace pqxx;
+using namespace sw::redis;
 
-#define SOCKET_BUFFER_SIZE 1024*10
-#define TEST_DB_CONNECTION "dbname = qol_indicator_development user = tyler hostaddr = 192.168.0.168 port = 5432"
-#define TEST_DB_REQUEST "SELECT isochrone_polygons.geometry, grocery_stores.food_quantity, grocery_stores.id FROM \"isochrone_polygons\" INNER JOIN grocery_stores ON grocery_stores.id = isochrone_polygons.isochronable_id WHERE (((south_bound <= 39.7266 AND 39.7266 <= north_bound) OR (south_bound <= 39.7703 AND 39.7703 <= north_bound) OR (39.7266 <= south_bound AND north_bound <= 39.7703)) AND ((west_bound <= -104.8975 AND -104.8975 <= east_bound) OR (west_bound <= -104.8537 AND -104.8537 <= east_bound) OR (-104.8975 <= west_bound AND east_bound <= -104.8537))) AND \"isochrone_polygons\".\"isochronable_type\" = 'GroceryStore' AND \"isochrone_polygons\".\"travel_type\" = 'driving' AND \"isochrone_polygons\".\"distance\" = 24"
-#define TEST_S3_URL "https://my-qoli-data.s3.us-west-2.amazonaws.com/12/grocery-store-food-quantity/abc/5000/1709.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAISFIT4X54HYTPPQA%2F20200810%2Fus-west-2%2Fs3%2Faws4_request&X-Amz-Date=20200810T035219Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=3847fd63916e6e4019dac0781990532a3a969946e1560be4f1b16c52aec58738"
+#define MAX_POSTGRES_QUERY_SIZE 1024*10
+#define REDIS_QUEUE_NAME "data_image_qda:queue"
+#define REDIS_STATUS_DIR_NAME "data_image_qda:status"
+// #define TEST_DB_CONNECTION "dbname = qol_indicator_development user = tyler hostaddr = 192.168.0.168 port = 5432"
 
 enum QualityCalcMethod { QualityLogExpSum = 0, QualityFirst = 1 };
 
@@ -345,20 +349,59 @@ int SendDataToURL(char *url, void *data, size_t data_size) {
 	return 0;
 }
 
+int CheckForQueue(Redis &redis, char *queue_name, string &queue_data) {
+	try {
+    auto val = redis.lpop(queue_name);
+		if(val) {
+			queue_data = *val;
+			return 1;
+		}
+		else
+			return 0;
+	} catch (const Error &e) {
+		fprintf(stderr, "%s\n", e.what());
+		return -1;
+	}
+}
+
+void ParseQueueData(string queue_data, long *queue_id, int32_t *start_lat,
+		int32_t *start_lng, double *multiply_const, int32_t *image_size,
+		double *quality_scale, enum QualityCalcMethod *quality_calc_method, 
+		double *quality_calc_value, char *polygons_db_request, char *aws_s3_url) {
+	int temp_for_enum;
+	sscanf(queue_data.c_str(), "%ld %d %d %lf %d %lf %d %lf %[^\n] %[^\n]",
+		queue_id,
+		start_lat,
+		start_lng,
+		multiply_const,
+		image_size,
+		quality_scale,
+		&temp_for_enum,
+		quality_calc_value,
+		aws_s3_url,
+		polygons_db_request		
+	);
+	*quality_calc_method = (enum QualityCalcMethod) temp_for_enum;
+}
+
 /**
 * Program main
   Listen to port given and if the special key is given
 */
 int main(int argc, char **argv) {
-	int num = 1;
-	if(argc < 3) {
-		fprintf(stderr, "Missing Port or Secret Key\n");
+	const char *PORT, *REDIS_URL, *PG_URL;
+	if(!(PORT = getenv("PORT"))) {
+		fprintf(stderr, "Missing PORT\n");
 		return 1;
 	}
-	char* PORT = argv[1];
-	char *SECRET_KEY = argv[2];
-	cout << "Received: " << PORT << " " << SECRET_KEY << endl;
-
+	if(!(REDIS_URL = getenv("REDIS_URL"))) {
+		fprintf(stderr, "Missing REDIS_URL\n");
+		return 1;
+	}
+	if(!(PG_URL = getenv("PG_URL"))) {
+		fprintf(stderr, "Missing PG_URL\n");
+		return 1;
+	}
 
 	int32_t *vectors;
 	double *poly_values;
@@ -366,62 +409,43 @@ int main(int argc, char **argv) {
 	enum QualityCalcMethod quality_calc_method;
 	double quality_scale, quality_calc_value, multiply_const;
 	int32_t *vector_lengths;
-	
-	start_lat = 231424;
-	start_lng = -611072;
-	multiply_const = 5825.422222222222;
-	image_size = 256;
-	quality_scale = 42000000;
-	quality_calc_method = (enum QualityCalcMethod)0;
-	quality_calc_value = 1.8;
-	
-    char buffer[SOCKET_BUFFER_SIZE] = {0};
-	std::string success = "Image Saved to S3";
-           // Let's check if port number is supplied or not..
-	
-	// Create a socket (IPv4, TCP)
-	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-	if (sockfd == -1) {
-		std::cout << "Failed to create socket. errno: " << errno << std::endl;
-		exit(EXIT_FAILURE);
-	}
+	long queue_id;
+	char polygons_db_request[MAX_POSTGRES_QUERY_SIZE];
+	char aws_s3_url[1024];
+	char status_key[128];
 
-	// Listen to port 9999 on any address
-	sockaddr_in sockaddr;
-	sockaddr.sin_family = AF_INET;
-	sockaddr.sin_addr.s_addr = INADDR_ANY;
-	sockaddr.sin_port = htons(atoi(PORT)); // htons is necessary to convert a number to
-									// network byte order
-	if (bind(sockfd, (struct sockaddr*)&sockaddr, sizeof(sockaddr)) < 0) {
-		std::cout << "Failed to bind to port. errno: " << errno << std::endl;
-		exit(EXIT_FAILURE);
-	}
-
-	// Start listening. Hold at most 10 connections in the queue
-	if (listen(sockfd, 10) < 0) {
-		std::cout << "Failed to listen on socket. errno: " << errno << std::endl;
-		exit(EXIT_FAILURE);
-	}
-
-	// Grab a connection from the queue
-	auto addrlen = sizeof(sockaddr);
-
-	while (1) {
-		cout << "Waiting for connection" << endl;
-		int connection = accept(sockfd, (struct sockaddr*)&sockaddr, (socklen_t*)&addrlen);
-		if (connection < 0) {
-			std::cout << "Failed to grab connection. errno: " << errno << std::endl;
-			exit(EXIT_FAILURE);
+	Redis redis = Redis(REDIS_URL);
+	string queue_data;
+	int queue_status;
+	while(1)
+	{
+		queue_status = CheckForQueue(redis, (char *) REDIS_QUEUE_NAME, queue_data);
+		if(queue_status == 0) {
+			sleep(2);
+			continue;
 		}
-
-		cout << "Reading connection" << endl;
-		// Read from the connection
-		auto bytesRead = read(connection, buffer, SOCKET_BUFFER_SIZE);
-		std::cout << "The message was: '" << buffer << "'" << endl;
+		else if(queue_status == -1) {
+			return 1;
+		}
+		sprintf(status_key,"%s:%d", REDIS_STATUS_DIR_NAME, queue_id)
+		redis.set(status_key, "started");
+		ParseQueueData(
+			queue_data,
+			&queue_id,
+			&start_lat,
+			&start_lng,
+			&multiply_const,
+			&image_size,
+			&quality_scale,
+			&quality_calc_method,
+			&quality_calc_value,
+			polygons_db_request,
+			aws_s3_url
+		);
 		cout << "Retrieving values" << endl;
 		RetrieveValuesFromPG(
-			TEST_DB_CONNECTION,
-			TEST_DB_REQUEST,
+			PG_URL,
+			polygons_db_request,
 			multiply_const,
 			&vectors,
 			&total_length,
@@ -450,18 +474,15 @@ int main(int argc, char **argv) {
 
 		cout << "Sending Request" << endl;
 		cout << "Png size: " << png_size << endl;
-		if(SendDataToURL(TEST_S3_URL, png_pointer, png_size))
+		if(SendDataToURL(aws_s3_url, png_pointer, png_size))
 			exit(1);
+		redis.set(status_key, "complete");
 
 		free(png_pointer);
 		free(vectors);
 		free(poly_values);
 		free(vector_lengths);
-		// Send a message to the connection
-		
-		send(connection, success.c_str(), success.size(), 0);
-		close(connection);
-    }
+	}
 
 	std::cin.ignore();
 	exit(0);
