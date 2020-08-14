@@ -31,12 +31,15 @@ ENV NVIDIA_DRIVER_CAPABILITIES compute,utility
 
 # App
 WORKDIR /usr/src/app
-COPY . .
+COPY . . 
+#  -Xptxas="-v" 
 RUN nvcc data_image_cuda.cu \
   -Iinc -I/usr/lib/redis-plus-plus/include\
   /usr/lib/redis-plus-plus/lib/libredis++.a \
   -o data_image -lm -lstdc++ -lpqxx -lcurl \
-  -Xcompiler="$(pkg-config vips --cflags --libs)" -lhiredis
+  -Xcompiler="$(pkg-config vips --cflags --libs)" -lhiredis \
+  -lvips -lz -lgobject-2.0 \
+  -lgmodule-2.0 -lgthread-2.0 -lglib-2.0
 # RUN nvcc data_image_cuda.cu -o data_image_cuda 
 # Start the main process.
 CMD bash -c "./data_image"

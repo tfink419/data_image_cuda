@@ -1,20 +1,28 @@
-// System includes
+// C standard libraries
+#include <stdio.h>
+#include <assert.h>
+#include <math.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <time.h>
+#include <signal.h>
+
+// Unix library
+#include <unistd.h>
+
+// Imported Libraries
+#include "vips/vips.h"
+#include <curl/curl.h>
+#include <sw/redis++/redis++.h>
+#include <pqxx/pqxx>
+
+// C++ standard libraries
 #include <iostream>
 #include <string>
 #include <memory>
 #include <utility>
-#include <cstdlib>
-
 #include <iomanip>
-#include <stdint.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <math.h>
-
-#include <sw/redis++/redis++.h>
-#include <pqxx/pqxx> 
-#include <curl/curl.h>
-#include "vips/vips.h"
+#include <string>
 
 
 using namespace std;
@@ -169,6 +177,7 @@ int PointInPolygonsImage(void **png_pointer, size_t *png_size, int32_t start_lat
 	scope = VIPS_OBJECT( vips_image_new() );
 	if(MemArrayToPngPointerWithFilter(scope, h_image_mem, h_found_mem, image_size, png_pointer, png_size))
 		vips_error_exit( NULL );
+  g_object_unref( scope );
 
 	free(h_image_mem);
 	switch (quality_calc_method) {
@@ -285,7 +294,6 @@ int SendDataToURL(char *url, void *data, size_t data_size) {
 		curl_easy_setopt(curl, CURLOPT_URL, url);
 		/* Now specify the POST data */ 
     	curl_easy_setopt(curl, CURLOPT_PUT, 1L);
-		png_size_for_callback = data_size;
     	curl_easy_setopt(curl, CURLOPT_READFUNCTION, image_curl_read_callback);
 
 		curl_easy_setopt(curl, CURLOPT_INFILESIZE, data_size);
@@ -347,11 +355,8 @@ void ParseQueueData(string queue_data, long *queue_id, int32_t *start_lat,
   Listen to port given and if the special key is given
 */
 int main(int argc, char **argv) {
-	const char *PORT, *REDIS_URL, *PG_URL;
-	if(!(PORT = getenv("PORT"))) {
-		fprintf(stderr, "Missing PORT\n");
-		return 1;
-	}
+	const char *REDIS_URL, *PG_URL;
+	
 	if(!(REDIS_URL = getenv("REDIS_URL"))) {
 		fprintf(stderr, "Missing REDIS_URL\n");
 		return 1;
@@ -359,6 +364,21 @@ int main(int argc, char **argv) {
 	if(!(PG_URL = getenv("PG_URL"))) {
 		fprintf(stderr, "Missing PG_URL\n");
 		return 1;
+	}
+
+	char REDIS_PASSWORD[256] = "", REDIS_TCP_URL[256] = "tcp://";
+	const char *loc_of_at, *loc_of_colon;
+	if(loc_of_at = strchr(REDIS_URL,'@')) {
+		loc_of_colon = strchr(REDIS_URL+8,':'); // : after "redis://"
+		if(loc_of_colon && loc_of_colon < loc_of_at) {
+			sscanf(REDIS_URL,"redis://%*[^:]:%[^@]@%s", REDIS_PASSWORD, REDIS_TCP_URL+6);
+		}
+		else {
+			sscanf(REDIS_URL,"redis://%[^@]@%s", REDIS_PASSWORD, REDIS_TCP_URL+6);
+		}
+	}
+	else {
+		sscanf(REDIS_URL,"redis://%s", REDIS_TCP_URL+6);
 	}
 
 	int32_t *vectors;
@@ -372,7 +392,10 @@ int main(int argc, char **argv) {
 	char aws_s3_url[1024];
 	char status_key[128];
 
-	Redis redis = Redis(REDIS_URL);
+	Redis redis = Redis(REDIS_TCP_URL);
+	if(REDIS_PASSWORD[0]) {
+		redis.auth(REDIS_PASSWORD);
+	}
 	string queue_data;
 	int queue_status;
 	while(1)
