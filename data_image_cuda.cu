@@ -528,7 +528,9 @@ int main(int argc, char **argv) {
 	char id_str[32];
 	connection *postgres_connection;
 	Redis *redis;
-
+	void *png_pointer = NULL;
+	size_t png_size;
+	int fork_return;
 	try {
 		redis = new Redis(REDIS_TCP_URL);
 		if(REDIS_PASSWORD[0]) {
@@ -590,43 +592,57 @@ int main(int argc, char **argv) {
 		);
 		cout << "Values Retrieved" << endl;
 
-		void *png_pointer = NULL;
-		size_t png_size;
-
 		cout << "Calculating..." << endl;
 
+		// Delete the png ponter before next call so there was time to copy it last time
+		if(png_pointer) {
+			free(png_pointer);
+			png_pointer = NULL;
+		}
 		if(PointInPolygonsImage(&png_pointer, &png_size, start_lat, start_lng, image_size, quality_scale, quality_calc_method, quality_calc_value,
 				vectors, total_length, poly_values, num_polys, vector_lengths))
 			exit(1);
-		if(png_pointer) {
-			cout << "Sending image" << endl;
-			cout << "Png size: " << png_size << endl;
-			if(SendDataToURL(aws_s3_url, png_pointer, png_size))
-				exit(1);
-			cout << "Image sent" << endl;
-			free(png_pointer);
+		if(vectors) {
+			free(vectors);
+			vectors = NULL;
+		}
+		if(poly_values) {
+			free(poly_values);
+			poly_values = NULL;
+		}
+		if(vector_lengths) {
+			free(vector_lengths);
+			vector_lengths = NULL;
+		}
+		if((fork_return = fork()) == 0) {
+			if(png_pointer) {
+				printf("Sending png image of size: %.2f KB\n", png_size/1024.0);
+				if(SendDataToURL(aws_s3_url, png_pointer, png_size))
+					exit(1);
+				cout << "Image sent" << endl;
+			}
+			else {
+				cout << "No image sent" << endl;
+			}
+			exit(0);
+		}
+		else if(fork_return > 0){
+			sprintf(complete_key, "%s:%d", REDIS_COMPLETE_BASE_NAME, queue_id);
+			time(&current_time);
+			sprintf(time_str, "%ld", current_time);
+			sprintf(id_str, "%d", queue_id);
+			redis->lpush(complete_key, "success");
+			sprintf(queue_details_key, "%s:%d", REDIS_QUEUE_DETAILS_BASE_NAME, queue_id);
+			redis->lrem(REDIS_WORKING_NAME, 0, id_str);
+			redis->lpush(REDIS_COMPLETE_BASE_NAME, id_str);
+			redis->del(queue_details_key);
+			redis->hset(details_key, "status", "success");
+			redis->hset(details_key, "completed_at", time_str);
 		}
 		else {
-			cout << "No image sent" << endl;
+			fprintf(stderr, "Error While Forking\n");
+			exit(1);
 		}
-		sprintf(complete_key, "%s:%d", REDIS_COMPLETE_BASE_NAME, queue_id);
-		time(&current_time);
-		sprintf(time_str, "%ld", current_time);
-		sprintf(id_str, "%d", queue_id);
-		redis->lpush(complete_key, "success");
-		sprintf(queue_details_key, "%s:%d", REDIS_QUEUE_DETAILS_BASE_NAME, queue_id);
-		redis->lrem(REDIS_WORKING_NAME, 0, id_str);
-		redis->lpush(REDIS_COMPLETE_BASE_NAME, id_str);
-		redis->del(queue_details_key);
-		redis->hset(details_key, "status", "success");
-		redis->hset(details_key, "completed_at", time_str);
-
-		if(vectors)
-			free(vectors);
-		if(poly_values)
-			free(poly_values);
-		if(vector_lengths)
-			free(vector_lengths);
 	}
 	try {
 		postgres_connection->disconnect();
