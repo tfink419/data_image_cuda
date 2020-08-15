@@ -460,18 +460,20 @@ int CheckForQueue(Redis &redis, char *queue_name, char *working_name, int32_t *q
 			unordered_map<string, string> m;
 			sscanf((*val).c_str(), "%d", queue_id);
 			sprintf(queue_details_key, "%s:%d", REDIS_QUEUE_DETAILS_BASE_NAME, *queue_id);
-			redis.hgetall(queue_details_key, std::inserter(m, m.begin()));
+			auto queue_details = redis.get(queue_details_key);
 			int temp_for_enum;
-			sscanf(m.at("start_lat").c_str(), "%d", start_lat);
-			sscanf(m.at("start_lng").c_str(), "%d", start_lng);
-			sscanf(m.at("multiply_const").c_str(), "%lf", multiply_const);
-			sscanf(m.at("image_size").c_str(), "%d", image_size);
-			sscanf(m.at("quality_scale").c_str(), "%lf", quality_scale);
-			sscanf(m.at("quality_calc_method").c_str(), "%d", &temp_for_enum);
+			sscanf((*queue_details).c_str(), "%d %d %lf %d %lf %d %lf %[^\n] %[^\n]",
+				start_lat, 
+				start_lng,
+				multiply_const,
+				image_size,
+				quality_scale,
+				&temp_for_enum,
+				quality_calc_value,
+				aws_s3_url,
+				polygons_db_request
+			);
 			*quality_calc_method = (enum QualityCalcMethod) temp_for_enum;
-			sscanf(m.at("quality_calc_value").c_str(), "%lf", quality_calc_value);
-			sscanf(m.at("aws_s3_url").c_str(), "%[^\n]", aws_s3_url);
-			sscanf(m.at("polygons_db_request").c_str(), "%[^\n]", polygons_db_request);
 			return 1;
 		}
 		else
@@ -522,9 +524,7 @@ int main(int argc, char **argv) {
 	char polygons_db_request[MAX_POSTGRES_QUERY_SIZE];
 	char aws_s3_url[1024];
 	char complete_key[64];
-	char details_key[64];
 	char queue_details_key[64];
-	char time_str[32];
 	char id_str[32];
 	connection *postgres_connection;
 	Redis *redis;
@@ -549,7 +549,6 @@ int main(int argc, char **argv) {
 	}
 	string queue_data;
 	int queue_status;
-	time_t current_time;
 	while(1)
 	{
 		cout << "Waiting for Queue" << endl;
@@ -574,11 +573,6 @@ int main(int argc, char **argv) {
 		else if(queue_status == -1) {
 			exit(1);
 		}
-		sprintf(details_key, "%s:%d", REDIS_DETAILS_BASE_NAME, queue_id);		time(&current_time);
-		time(&current_time);
-		sprintf(time_str, "%ld", current_time);
-		redis->hset(details_key, "started_at", time_str);
-
 		cout << "Retrieving values" << endl;
 		RetrieveValuesFromPG(
 			postgres_connection,
@@ -628,16 +622,10 @@ int main(int argc, char **argv) {
 		}
 		else if(fork_return > 0){
 			sprintf(complete_key, "%s:%d", REDIS_COMPLETE_BASE_NAME, queue_id);
-			time(&current_time);
-			sprintf(time_str, "%ld", current_time);
 			sprintf(id_str, "%d", queue_id);
 			redis->lpush(complete_key, "success");
-			sprintf(queue_details_key, "%s:%d", REDIS_QUEUE_DETAILS_BASE_NAME, queue_id);
 			redis->lrem(REDIS_WORKING_NAME, 0, id_str);
-			redis->lpush(REDIS_COMPLETE_BASE_NAME, id_str);
 			redis->del(queue_details_key);
-			redis->hset(details_key, "status", "success");
-			redis->hset(details_key, "completed_at", time_str);
 		}
 		else {
 			fprintf(stderr, "Error While Forking\n");
