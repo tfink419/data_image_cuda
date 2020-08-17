@@ -192,7 +192,7 @@ int PointInPolygonsImage(void **png_pointer, size_t *png_size, int32_t start_lat
 	switch (quality_calc_method) {
 	case QualityFirst:
 		if (!(h_found_mem = reinterpret_cast<uint8_t *>(malloc(found_mem_size)))) {
-			fprintf(stderr, "Failed to allocate host found mem!\n");
+			cerr << "Failed to allocate host found mem!" << endl;
 			exit(EXIT_FAILURE);
 		}
 		checkCudaErrors(cudaMalloc(reinterpret_cast<void **>(&d_found_mem), found_mem_size));
@@ -203,7 +203,7 @@ int PointInPolygonsImage(void **png_pointer, size_t *png_size, int32_t start_lat
 
 
 	if (!(h_image_mem = reinterpret_cast<uint8_t *>(malloc(image_mem_size)))) {
-		fprintf(stderr, "Failed to allocate host image mem!\n");
+		cerr << "Failed to allocate host image mem!" << endl;
 		exit(EXIT_FAILURE);
 	}
 
@@ -213,9 +213,9 @@ int PointInPolygonsImage(void **png_pointer, size_t *png_size, int32_t start_lat
 	checkCudaErrors(cudaMalloc(reinterpret_cast<void **>(&d_image_mem), image_mem_size));
 	checkCudaErrors(cudaMalloc(reinterpret_cast<void **>(&d_all_blank), sizeof(uint8_t)));
 	// Allocate CUDA events that we'll use for timing
-	cudaEvent_t start, stop;
-	checkCudaErrors(cudaEventCreate(&start));
-	checkCudaErrors(cudaEventCreate(&stop));
+	// cudaEvent_t start, stop;
+	// checkCudaErrors(cudaEventCreate(&start));
+	// checkCudaErrors(cudaEventCreate(&stop));
 
 	checkCudaErrors(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
@@ -235,12 +235,12 @@ int PointInPolygonsImage(void **png_pointer, size_t *png_size, int32_t start_lat
 	dim3 grid((image_size + threads.x - 1) / threads.x, (image_size + threads.y - 1) / threads.y);
 
 	// Create and start timer
-	printf("Computing result using CUDA Kernel...\n");
+	// printf("Computing result using CUDA Kernel...\n");
 
 	// Record the start event
-	checkCudaErrors(cudaEventRecord(start, stream));
-	printf("Sending grid: [%d,%d]\n", grid.x, grid.y);
-	printf("Processing %d vectors %d times\n", total_length, image_size*image_size);
+	// checkCudaErrors(cudaEventRecord(start, stream));
+	// printf("Sending grid: [%d,%d]\n", grid.x, grid.y);
+	// printf("Processing %d vectors %d times\n", total_length, image_size*image_size);
 	// Performs warmup operation using matrixMul CUDA kernel
 	PointsInPolygonsCUDA << < grid, threads, 0, stream >> > (start_lat, start_lng, image_size,
 		num_polys, quality_scale, quality_calc_method, quality_calc_value,
@@ -253,19 +253,18 @@ int PointInPolygonsImage(void **png_pointer, size_t *png_size, int32_t start_lat
 	}
 
 	// Record the stop event
-	checkCudaErrors(cudaEventRecord(stop, stream));
+	// checkCudaErrors(cudaEventRecord(stop, stream));
 
 	// Wait for the stop event to complete
-	checkCudaErrors(cudaEventSynchronize(stop));
+	// checkCudaErrors(cudaEventSynchronize(stop));
 
-	float msecTotal = 0.0f;
-	checkCudaErrors(cudaEventElapsedTime(&msecTotal, start, stop));
+	// float msecTotal = 0.0f;
+	// checkCudaErrors(cudaEventElapsedTime(&msecTotal, start, stop));
 
 	// Compute and print the performance
-	printf(
-		"Time= %.3f msec, GInt64OPS=%.3f\n",
-		msecTotal, (float)total_length*image_size*image_size/(msecTotal/1000)/1024/1024/1024);
-	std::cin.ignore();
+	// printf(
+	// 	"Time= %.3f msec, GInt64OPS=%.3f\n",
+	// 	msecTotal, (float)total_length*image_size*image_size/(msecTotal/1000)/1024/1024/1024);
 
 	// Copy result from device to host
 	checkCudaErrors(cudaMemcpyAsync(h_all_blank, d_all_blank, sizeof(char), cudaMemcpyDeviceToHost, stream));
@@ -286,8 +285,8 @@ int PointInPolygonsImage(void **png_pointer, size_t *png_size, int32_t start_lat
 	checkCudaErrors(cudaFree(d_image_mem));
 	checkCudaErrors(cudaFree(d_poly_values));
 	checkCudaErrors(cudaFree(d_vector_lengths));
-	checkCudaErrors(cudaEventDestroy(start));
-	checkCudaErrors(cudaEventDestroy(stop));
+	// checkCudaErrors(cudaEventDestroy(start));
+	// checkCudaErrors(cudaEventDestroy(stop));
 
 	if(*h_all_blank) {
 		*png_pointer = NULL;
@@ -390,8 +389,8 @@ int RetrieveValuesFromPG(connection *C, string select_request, double multiply_c
 			(*poly_values)[i] = c[1].as<double>();
 			JsonGeometryToVectors(c[0].as<string>(), multiply_const, vectors, total_length, (*vector_lengths)+i);
 		}
-	} catch (const std::exception &e) {
-		cerr << e.what() << std::endl;
+	} catch (const exception &e) {
+		cerr << e.what() << endl;
 		return 1;
 	}
 	return 0;
@@ -403,7 +402,6 @@ static size_t image_curl_read_callback(void *dest_ptr, size_t size, size_t nmemb
 	size_t amount_to_read = size*nmemb;
 	if(png_size_for_callback-callback_written_so_far < amount_to_read)
 		amount_to_read = png_size_for_callback-callback_written_so_far;
-	cout << "Copying " << amount_to_read << " bytes" << endl;
 
 	memcpy(dest_ptr, src_ptr+callback_written_so_far, amount_to_read);
 	callback_written_so_far += amount_to_read;
@@ -449,19 +447,23 @@ int SendDataToURL(char *url, void *data, size_t data_size) {
 	return 0;
 }
 
-int CheckForQueue(Redis &redis, char *queue_name, char *working_name, int32_t *queue_id, int32_t *start_lat,
+int CheckForQueue(Redis &redis, char *queue_name, char *working_name,
+		char *queue_details_key, int32_t *queue_id, int32_t *start_lat,
 		int32_t *start_lng, double *multiply_const, int32_t *image_size,
 		double *quality_scale, enum QualityCalcMethod *quality_calc_method, 
 		double *quality_calc_value, char *polygons_db_request, char *aws_s3_url) {
-	char queue_details_key[64];
 	try {
-    auto val = redis.brpoplpush(queue_name, working_name, 0);
-		if(val) {
+    auto id = redis.brpoplpush(queue_name, working_name, 0);
+		if(id) {
 			unordered_map<string, string> m;
-			sscanf((*val).c_str(), "%d", queue_id);
+			sscanf((*id).c_str(), "%d", queue_id);
 			sprintf(queue_details_key, "%s:%d", REDIS_QUEUE_DETAILS_BASE_NAME, *queue_id);
 			auto queue_details = redis.get(queue_details_key);
 			int temp_for_enum;
+			if(!queue_details) {
+				redis.lrem(working_name, 1, (*id).c_str());
+				return 0;
+			}
 			sscanf((*queue_details).c_str(), "%d %d %lf %d %lf %d %lf %[^\n] %[^\n]",
 				start_lat, 
 				start_lng,
@@ -479,7 +481,7 @@ int CheckForQueue(Redis &redis, char *queue_name, char *working_name, int32_t *q
 		else
 			return 0;
 	} catch (const Error &e) {
-		fprintf(stderr, "%s\n", e.what());
+		cerr << e.what() << endl;
 		return -1;
 	}
 }
@@ -490,28 +492,29 @@ int CheckForQueue(Redis &redis, char *queue_name, char *working_name, int32_t *q
 int main(int argc, char **argv) {
 	signal(SIGINT, signalHandler);
 	const char *REDIS_URL, *PG_URL;
-	if(!(REDIS_URL = getenv("REDIS_URL"))) {
+	if(!(REDIS_URL = getenv("REDIS_URL")) || !REDIS_URL[0]) {
+		cerr << "Missing REDIS_URL" << endl;
 		fprintf(stderr, "Missing REDIS_URL\n");
-		return 1;
+		exit(1);
 	}
-	if(!(PG_URL = getenv("PG_URL"))) {
-		fprintf(stderr, "Missing PG_URL\n");
-		return 1;
+	if(!(PG_URL = getenv("PG_URL")) || !PG_URL[0]) {
+		cerr << "Missing PG_URL" << endl;
+		exit(1);
 	}
 
-	char REDIS_PASSWORD[256] = "", REDIS_TCP_URL[256] = "tcp://";
+	char REDIS_PASSWORD[128] = "", REDIS_HOST[128], REDIS_PORT[8] = "";
 	const char *loc_of_at, *loc_of_colon;
 	if(loc_of_at = strchr(REDIS_URL,'@')) {
 		loc_of_colon = strchr(REDIS_URL+8,':'); // : after "redis://"
 		if(loc_of_colon && loc_of_colon < loc_of_at) {
-			sscanf(REDIS_URL,"redis://%*[^:]:%[^@]@%s", REDIS_PASSWORD, REDIS_TCP_URL+6);
+			sscanf(REDIS_URL,"redis://%*[^:]:%[^@]@%[^:]:%s", REDIS_PASSWORD, REDIS_HOST, REDIS_PORT);
 		}
 		else {
-			sscanf(REDIS_URL,"redis://%[^@]@%s", REDIS_PASSWORD, REDIS_TCP_URL+6);
+			sscanf(REDIS_URL,"redis://%[^@]@%[^:]:%s", REDIS_PASSWORD, REDIS_HOST, REDIS_PORT);
 		}
 	}
 	else {
-		sscanf(REDIS_URL,"redis://%s", REDIS_TCP_URL+6);
+		sscanf(REDIS_URL,"redis://%[^:]:%s", REDIS_HOST, REDIS_PORT);
 	}
 
 	int32_t *vectors = NULL;
@@ -526,36 +529,44 @@ int main(int argc, char **argv) {
 	char complete_key[64];
 	char queue_details_key[64];
 	char id_str[32];
+
 	connection *postgres_connection;
+	ConnectionOptions connection_options; // Redis connection
+	connection_options.host = REDIS_HOST;
+	if(REDIS_PORT[0])
+		connection_options.port = atoi(REDIS_PORT);
+	
+	if(REDIS_PASSWORD[0])
+		connection_options.password = REDIS_PASSWORD;
+	connection_options.keep_alive = true;
 	Redis *redis;
 	void *png_pointer = NULL;
 	size_t png_size;
 	int fork_return;
 	try {
-		redis = new Redis(REDIS_TCP_URL);
-		if(REDIS_PASSWORD[0]) {
-			redis->auth(REDIS_PASSWORD);
-		}
+		redis = new Redis(connection_options);
 		postgres_connection = new connection(PG_URL);
 		if (postgres_connection->is_open()) {
-			cout << "Opened database successfully: " << postgres_connection->dbname() << endl;
+			cout << "Opened PG database successfully: " << postgres_connection->dbname() << endl;
 		} else {
-			cout << "Can't open database" << endl;
+			cerr << "Can't open database" << endl;
 			exit(1);
 		}
 	} catch (const Error &e) {
-		fprintf(stderr, "%s\n", e.what());
+		cerr << e.what() << endl;
 		exit(1);
 	}
+	auto pipe = redis->pipeline();
 	string queue_data;
 	int queue_status;
 	while(1)
 	{
-		cout << "Waiting for Queue" << endl;
+		// cout << "Waiting for Queue\n";
 		queue_status = CheckForQueue(
 			*redis, 
 			(char *) REDIS_QUEUE_NAME,
 			(char *) REDIS_WORKING_NAME,
+			queue_details_key,
 			&queue_id,
 			&start_lat,
 			&start_lng,
@@ -573,7 +584,7 @@ int main(int argc, char **argv) {
 		else if(queue_status == -1) {
 			exit(1);
 		}
-		cout << "Retrieving values" << endl;
+
 		RetrieveValuesFromPG(
 			postgres_connection,
 			polygons_db_request,
@@ -584,15 +595,9 @@ int main(int argc, char **argv) {
 			&num_polys,
 			&vector_lengths
 		);
-		cout << "Values Retrieved" << endl;
 
-		cout << "Calculating..." << endl;
+		cout << "Calculating...\n";
 
-		// Delete the png ponter before next call so there was time to copy it last time
-		if(png_pointer) {
-			free(png_pointer);
-			png_pointer = NULL;
-		}
 		if(PointInPolygonsImage(&png_pointer, &png_size, start_lat, start_lng, image_size, quality_scale, quality_calc_method, quality_calc_value,
 				vectors, total_length, poly_values, num_polys, vector_lengths))
 			exit(1);
@@ -608,34 +613,33 @@ int main(int argc, char **argv) {
 			free(vector_lengths);
 			vector_lengths = NULL;
 		}
-		if((fork_return = fork()) == 0) {
-			if(png_pointer) {
-				printf("Sending png image of size: %.2f KB\n", png_size/1024.0);
-				if(SendDataToURL(aws_s3_url, png_pointer, png_size))
-					exit(1);
-				cout << "Image sent" << endl;
-			}
-			else {
-				cout << "No image sent" << endl;
-			}
-			exit(0);
-		}
-		else if(fork_return > 0){
-			sprintf(complete_key, "%s:%d", REDIS_COMPLETE_BASE_NAME, queue_id);
-			sprintf(id_str, "%d", queue_id);
-			redis->lpush(complete_key, "success");
-			redis->lrem(REDIS_WORKING_NAME, 0, id_str);
-			redis->del(queue_details_key);
+		if(png_pointer) {
+			if(SendDataToURL(aws_s3_url, png_pointer, png_size))
+				exit(1);
+			printf("Sent png image of size: %.2f KB\n", png_size/1024.0);
+			free(png_pointer);
 		}
 		else {
-			fprintf(stderr, "Error While Forking\n");
+			cout << "No image sent\n";
+		}
+		sprintf(complete_key, "%s:%d", REDIS_COMPLETE_BASE_NAME, queue_id);
+		sprintf(id_str, "%d", queue_id);
+		try {
+			pipe.lpush(complete_key, "success").
+			expire(complete_key, 300).
+			lrem(REDIS_WORKING_NAME, 1, id_str).
+			del(queue_details_key).
+			exec();
+		} catch (const Error &e) {
+			cerr << e.what() << endl;
 			exit(1);
 		}
+		
 	}
 	try {
 		postgres_connection->disconnect();
 	} catch (const Error &e) {
-		fprintf(stderr, "%s\n", e.what());
+		cerr << e.what() << endl;
 		exit(1);
 	}
 	delete postgres_connection;
