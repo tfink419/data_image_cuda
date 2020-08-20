@@ -20,6 +20,7 @@
 
 // Unix library
 #include <unistd.h>
+#include <pthread.h>
 
 // Imported Libraries
 #include "vips/vips.h"
@@ -52,17 +53,10 @@ using namespace sw::redis;
 #define REDIS_COMPLETE_BASE_NAME "data_image_qda:complete"
 #define REDIS_QUEUE_DETAILS_BASE_NAME "data_image_qda:queue_details"
 #define REDIS_DETAILS_BASE_NAME "data_image_qda:details"
+#define PNG_POOL_SIZE 32
+#define PNG_UPLOAD_WAIT_TIME 30000
 
 enum QualityCalcMethod { QualityLogExpSum = 0, QualityFirst = 1 };
-
-void signalHandler( int signum ) {
-	cout << "Interrupt signal (" << signum << ") received.\n";
-
-	// cleanup and close up stuff here  
-	// terminate program  
-
-	exit(signum);  
-}
 
 /**
 * Point-In-Polygons for a block using CUDA
@@ -396,55 +390,86 @@ int RetrieveValuesFromPG(connection *C, string select_request, double multiply_c
 	return 0;
 }
 
-size_t png_size_for_callback, callback_written_so_far;
-static size_t image_curl_read_callback(void *dest_ptr, size_t size, size_t nmemb, void *src_ptr)
+struct WriteThis {
+  void *readptr;
+  size_t sizeleft;
+};
+ 
+static size_t image_curl_read_callback(void *dest, size_t size, size_t nmemb, void *userp)
 {
-	size_t amount_to_read = size*nmemb;
-	if(png_size_for_callback-callback_written_so_far < amount_to_read)
-		amount_to_read = png_size_for_callback-callback_written_so_far;
-
-	memcpy(dest_ptr, src_ptr+callback_written_so_far, amount_to_read);
-	callback_written_so_far += amount_to_read;
-  return amount_to_read;
+  struct WriteThis *wt = (struct WriteThis *)userp;
+  size_t buffer_size = size*nmemb;
+ 
+  if(wt->sizeleft) {
+    /* copy as much as possible from the source to the destination */ 
+    size_t copy_this_much = wt->sizeleft;
+    if(copy_this_much > buffer_size)
+      copy_this_much = buffer_size;
+    memcpy(dest, wt->readptr, copy_this_much);
+ 
+    wt->readptr = wt->readptr+copy_this_much;
+    wt->sizeleft -= copy_this_much;
+    return copy_this_much; /* we copied this many bytes */ 
+  }
+ 
+  return 0; /* no more data left to deliver */ 
 }
 
-int SendDataToURL(char *url, void *data, size_t data_size) {
-	CURL *curl;
-	CURLcode res;
+struct CurlThreadInfo {
+	char url[1024];
+	void *data;
+	pthread_t thread_id;
+	size_t thread_num;
+	size_t data_size;
+};
 
-	/* In windows, this will init the winsock stuff */ 
-	curl_global_init(CURL_GLOBAL_ALL);
-
-	/* get a curl handle */ 
-	curl = curl_easy_init();
+void * SendDataToURL(void *args) {
+	struct CurlThreadInfo *curl_info = (struct CurlThreadInfo *) args;
+ 	/* get a curl handle */ 
+	CURL *curl = curl_easy_init();
+  CURLcode res;
 	if(curl) {
 		/* First set the URL that is about to receive our POST. This URL can
 			just as well be a https:// URL if that is what should receive the
 			data. */ 
-		curl_easy_setopt(curl, CURLOPT_URL, url);
-		/* Now specify the POST data */ 
+ 
+    /* set our custom set of headers */ 
+		struct curl_slist *curl_header = NULL;
+		curl_header = curl_slist_append(curl_header, "Content-Type: image/png");
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_header);
+		
+		curl_easy_setopt(curl, CURLOPT_URL, curl_info->url);
+		/* Now specify the PUT data */ 
 		curl_easy_setopt(curl, CURLOPT_PUT, 1L);
 		
 		curl_easy_setopt(curl, CURLOPT_READFUNCTION, image_curl_read_callback);
 
-		curl_easy_setopt(curl, CURLOPT_INFILESIZE, data_size);
+		curl_easy_setopt(curl, CURLOPT_INFILESIZE, curl_info->data_size);
+	
 		
-		png_size_for_callback = data_size;
-		callback_written_so_far = 0;
-		curl_easy_setopt(curl, CURLOPT_READDATA, data);
+		struct WriteThis wt;
+ 
+		wt.readptr = curl_info->data;
+		wt.sizeleft = curl_info->data_size;
+		curl_easy_setopt(curl, CURLOPT_READDATA, &wt);
 
 		/* Perform the request, res will get the return code */ 
 		res = curl_easy_perform(curl);
-		/* Check for errors */ 
-		if(res != CURLE_OK)
-			fprintf(stderr, "curl_easy_perform() failed: %s\n",
-				curl_easy_strerror(res));
-
-		/* always cleanup */ 
-		curl_easy_cleanup(curl);
+		if(res != CURLE_OK) {
+      fprintf(stderr, "curl_easy_perform() failed: %s\n",
+							curl_easy_strerror(res));
+			return (void *)1;
+		}
+ 
+		curl_slist_free_all(curl_header);
+    /* always cleanup */ 
+    curl_easy_cleanup(curl);
 	}
-	curl_global_cleanup();
-	return 0;
+	else {
+		cerr << "Curl Failed to Initialize" << endl;
+		return (void *)1;
+	}
+	return NULL;
 }
 
 int CheckForQueue(Redis &redis, char *queue_name, char *working_name,
@@ -453,7 +478,7 @@ int CheckForQueue(Redis &redis, char *queue_name, char *working_name,
 		double *quality_scale, enum QualityCalcMethod *quality_calc_method, 
 		double *quality_calc_value, char *polygons_db_request, char *aws_s3_url) {
 	try {
-    auto id = redis.brpoplpush(queue_name, working_name, 0);
+    auto id = redis.brpoplpush(queue_name, working_name, 30);
 		if(id) {
 			unordered_map<string, string> m;
 			sscanf((*id).c_str(), "%d", queue_id);
@@ -486,12 +511,39 @@ int CheckForQueue(Redis &redis, char *queue_name, char *working_name,
 	}
 }
 
+int has_sig_inted = 0;
+
+static void hdl (int sig, siginfo_t *siginfo, void *context)
+{
+	has_sig_inted = 1;
+}
+
 /**
 * Program main
 */
 int main(int argc, char **argv) {
-	signal(SIGINT, signalHandler);
+	struct sigaction act;
+ 
+	memset (&act, '\0', sizeof(act));
+ 
+	/* Use the sa_sigaction field because the handles has two additional parameters */
+	act.sa_sigaction = &hdl;
+ 
+	/* The SA_SIGINFO flag tells sigaction() to use the sa_sigaction field, not sa_handler. */
+	act.sa_flags = SA_SIGINFO;
+
+	if (sigaction(SIGINT, &act, NULL) < 0) {
+		perror ("sigaction");
+		return 1;
+	}
+
+	if (sigaction(SIGTERM, &act, NULL) < 0) {
+		perror ("sigaction");
+		return 1;
+	}
+ 
 	const char *REDIS_URL, *PG_URL;
+	// Check ENV Vars
 	if(!(REDIS_URL = getenv("REDIS_URL")) || !REDIS_URL[0]) {
 		cerr << "Missing REDIS_URL" << endl;
 		fprintf(stderr, "Missing REDIS_URL\n");
@@ -502,6 +554,7 @@ int main(int argc, char **argv) {
 		exit(1);
 	}
 
+	// Parse Redis URL
 	char REDIS_PASSWORD[128] = "", REDIS_HOST[128], REDIS_PORT[8] = "";
 	const char *loc_of_at, *loc_of_colon;
 	if(loc_of_at = strchr(REDIS_URL,'@')) {
@@ -516,7 +569,6 @@ int main(int argc, char **argv) {
 	else {
 		sscanf(REDIS_URL,"redis://%[^:]:%s", REDIS_HOST, REDIS_PORT);
 	}
-
 	int32_t *vectors = NULL;
 	double *poly_values = NULL;
 	int32_t num_polys, start_lat, start_lng, image_size, total_length;
@@ -525,24 +577,26 @@ int main(int argc, char **argv) {
 	int32_t *vector_lengths = NULL;
 	int32_t queue_id;
 	char polygons_db_request[MAX_POSTGRES_QUERY_SIZE];
-	char aws_s3_url[1024];
 	char complete_key[64];
 	char queue_details_key[64];
 	char id_str[32];
+	int thread_status;
+	size_t i;
 
+	/* In windows, this will init the winsock stuff */ 
+	curl_global_init(CURL_GLOBAL_ALL);
+	
+	// DB connections setup
 	connection *postgres_connection;
 	ConnectionOptions connection_options; // Redis connection
 	connection_options.host = REDIS_HOST;
 	if(REDIS_PORT[0])
 		connection_options.port = atoi(REDIS_PORT);
-	
 	if(REDIS_PASSWORD[0])
 		connection_options.password = REDIS_PASSWORD;
 	connection_options.keep_alive = true;
 	Redis *redis;
-	void *png_pointer = NULL;
-	size_t png_size;
-	int fork_return;
+
 	try {
 		redis = new Redis(connection_options);
 		postgres_connection = new connection(PG_URL);
@@ -559,8 +613,27 @@ int main(int argc, char **argv) {
 	auto pipe = redis->pipeline();
 	string queue_data;
 	int queue_status;
+	struct CurlThreadInfo curl_threads[PNG_POOL_SIZE] = {0};
+	for(i = 1; i <= PNG_POOL_SIZE; i++)
+		curl_threads[i].thread_num = i;
+
+	void *thread_res;
+	int current_png = 0;
 	while(1)
 	{
+		if(has_sig_inted) {
+			cout << "Received SIGINT or TERM and gracefully quiting" << endl;
+			cout << "Clearing CURL Queue" << endl;
+
+			for (i = 0; i < current_png; i++) {
+				if(thread_status = pthread_join(curl_threads[i].thread_id, &thread_res)) {
+					cerr << "Error joining thread: " << thread_status << endl;
+					exit(1);
+				}
+				free(curl_threads[i].data);
+			}
+			break;
+		}
 		// cout << "Waiting for Queue\n";
 		queue_status = CheckForQueue(
 			*redis, 
@@ -576,7 +649,7 @@ int main(int argc, char **argv) {
 			&quality_calc_method,
 			&quality_calc_value,
 			polygons_db_request,
-			aws_s3_url
+			curl_threads[current_png].url
 		);
 		if(queue_status == 0) {
 			continue;
@@ -598,7 +671,7 @@ int main(int argc, char **argv) {
 
 		cout << "Calculating...\n";
 
-		if(PointInPolygonsImage(&png_pointer, &png_size, start_lat, start_lng, image_size, quality_scale, quality_calc_method, quality_calc_value,
+		if(PointInPolygonsImage(&curl_threads[current_png].data, &curl_threads[current_png].data_size, start_lat, start_lng, image_size, quality_scale, quality_calc_method, quality_calc_value,
 				vectors, total_length, poly_values, num_polys, vector_lengths))
 			exit(1);
 		if(vectors) {
@@ -613,14 +686,29 @@ int main(int argc, char **argv) {
 			free(vector_lengths);
 			vector_lengths = NULL;
 		}
-		if(png_pointer) {
-			if(SendDataToURL(aws_s3_url, png_pointer, png_size))
+		if(curl_threads[current_png].data) {
+			printf("Sending png image of size: %.2f KB\n", curl_threads[current_png].data_size/1024.0);
+			if (thread_status = pthread_create(&curl_threads[current_png].thread_id, NULL,
+				&SendDataToURL, &curl_threads[current_png])) {
+				cerr << "Error creating thread: " << thread_status << endl;
 				exit(1);
-			printf("Sent png image of size: %.2f KB\n", png_size/1024.0);
-			free(png_pointer);
+			}
+			if(++current_png >= PNG_POOL_SIZE) {
+				current_png = 0;
+				cout << "Clearing CURL Queue" << endl;
+
+				for (i = 0; i < PNG_POOL_SIZE; i++) {
+					if(thread_status = pthread_join(curl_threads[i].thread_id, &thread_res)) {
+						cerr << "Error joining thread: " << thread_status << endl;
+						exit(1);
+					}
+					free(curl_threads[i].data);
+					curl_threads[i].data = NULL;
+				}
+			}
 		}
 		else {
-			cout << "No image sent\n";
+			cout << "No image to send\n";
 		}
 		sprintf(complete_key, "%s:%d", REDIS_COMPLETE_BASE_NAME, queue_id);
 		sprintf(id_str, "%d", queue_id);
@@ -644,5 +732,6 @@ int main(int argc, char **argv) {
 	}
 	delete postgres_connection;
 	delete redis;
+	curl_global_cleanup();
 	exit(0);
 }

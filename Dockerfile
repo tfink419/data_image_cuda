@@ -42,4 +42,4 @@ RUN nvcc data_image_cuda.cu \
   -lgmodule-2.0 -lgthread-2.0 -lglib-2.0
 # RUN nvcc data_image_cuda.cu -o data_image_cuda 
 # Start the main process.
-CMD bash -c "./data_image"
+CMD ["./data_image"]
