@@ -1,14 +1,3 @@
-/**
-* Copyright 1993-2015 NVIDIA Corporation.  All rights reserved.
-*
-* Please refer to the NVIDIA end user license agreement (EULA) associated
-* with this source code for terms and conditions that govern your use of
-* this software. Any use, reproduction, disclosure, or distribution of
-* this software and related documentation outside the terms of the EULA
-* is strictly prohibited.
-*
-*/
-
 // C standard libraries
 #include <stdio.h>
 #include <assert.h>
@@ -391,7 +380,7 @@ int RetrieveValuesFromPG(connection *C, string select_request, double multiply_c
 }
 
 struct WriteThis {
-  void *readptr;
+  char *readptr;
   size_t sizeleft;
 };
  
@@ -407,7 +396,7 @@ static size_t image_curl_read_callback(void *dest, size_t size, size_t nmemb, vo
       copy_this_much = buffer_size;
     memcpy(dest, wt->readptr, copy_this_much);
  
-    wt->readptr = wt->readptr+copy_this_much;
+    wt->readptr += copy_this_much;
     wt->sizeleft -= copy_this_much;
     return copy_this_much; /* we copied this many bytes */ 
   }
@@ -446,10 +435,9 @@ void * SendDataToURL(void *args) {
 
 		curl_easy_setopt(curl, CURLOPT_INFILESIZE, curl_info->data_size);
 	
-		
 		struct WriteThis wt;
  
-		wt.readptr = curl_info->data;
+		wt.readptr = (char *)curl_info->data;
 		wt.sizeleft = curl_info->data_size;
 		curl_easy_setopt(curl, CURLOPT_READDATA, &wt);
 
@@ -623,15 +611,6 @@ int main(int argc, char **argv) {
 	{
 		if(has_sig_inted) {
 			cout << "Received SIGINT or TERM and gracefully quiting" << endl;
-			cout << "Clearing CURL Queue" << endl;
-
-			for (i = 0; i < current_png; i++) {
-				if(thread_status = pthread_join(curl_threads[i].thread_id, &thread_res)) {
-					cerr << "Error joining thread: " << thread_status << endl;
-					exit(1);
-				}
-				free(curl_threads[i].data);
-			}
 			break;
 		}
 		// cout << "Waiting for Queue\n";
@@ -651,7 +630,18 @@ int main(int argc, char **argv) {
 			polygons_db_request,
 			curl_threads[current_png].url
 		);
-		if(queue_status == 0) {
+		if(queue_status == 0) { // Redis Blocking Timeout
+			cout << "Clearing CURL Queue" << endl;
+
+			for (i = 0; i < current_png; i++) {
+				if(thread_status = pthread_join(curl_threads[i].thread_id, &thread_res)) {
+					cerr << "Error joining thread: " << thread_status << endl;
+					exit(1);
+				}
+				free(curl_threads[i].data);
+				curl_threads[i].data = NULL;
+			}
+			current_png = 0;
 			continue;
 		}
 		else if(queue_status == -1) {
@@ -723,6 +713,14 @@ int main(int argc, char **argv) {
 			exit(1);
 		}
 		
+	}
+	cout << "Clearing CURL Queue" << endl;
+	for (i = 0; i < current_png; i++) {
+		if(thread_status = pthread_join(curl_threads[i].thread_id, &thread_res)) {
+			cerr << "Error joining thread: " << thread_status << endl;
+			exit(1);
+		}
+		free(curl_threads[i].data);
 	}
 	try {
 		postgres_connection->disconnect();
